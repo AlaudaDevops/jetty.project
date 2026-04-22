@@ -142,6 +142,18 @@ public class HttpParser
         CLOSED  // The associated stream/endpoint is at EOF
     }
 
+    public enum ChunkParamsState
+    {
+        EXT_BWS,
+        EXT_NAME_BWS_BEFORE,
+        EXT_NAME,
+        EXT_NAME_BWS_AFTER,
+        EXT_VALUE_BWS_BEFORE,
+        EXT_VALUE,
+        EXT_VALUE_OPEN_QUOTE,
+        EXT_VALUE_CLOSE_QUOTE
+    }
+
     private static final EnumSet<State> __idleStates = EnumSet.of(State.START, State.END, State.CLOSE, State.CLOSED);
     private static final EnumSet<State> __completeStates = EnumSet.of(State.END, State.CLOSE, State.CLOSED);
     private static final EnumSet<State> __terminatedStates = EnumSet.of(State.CLOSE, State.CLOSED);
@@ -184,6 +196,8 @@ public class HttpParser
 
     private int _length;
     private final StringBuilder _string = new StringBuilder();
+    private ChunkParamsState _chunkParamsState = ChunkParamsState.EXT_BWS;
+    private boolean _chunkQuotedEscape;
 
     static
     {
@@ -1778,6 +1792,8 @@ public class HttpParser
                             break;
 
                         case SPACE:
+                        case HTAB:
+                            setChunkParamsState(ChunkParamsState.EXT_BWS);
                             setState(State.CHUNK_PARAMS);
                             break;
 
@@ -1788,9 +1804,14 @@ public class HttpParser
                                     throw new BadMessageException(HttpStatus.PAYLOAD_TOO_LARGE_413);
                                 _chunkLength = _chunkLength * 16 + t.getHexDigit();
                             }
+                            else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == ';')
+                            {
+                                setChunkParamsState(ChunkParamsState.EXT_NAME_BWS_BEFORE);
+                                setState(State.CHUNK_PARAMS);
+                            }
                             else
                             {
-                                setState(State.CHUNK_PARAMS);
+                                throw new IllegalCharacterException(_state, t, buffer);
                             }
                     }
                     break;
@@ -1798,25 +1819,8 @@ public class HttpParser
 
                 case CHUNK_PARAMS:
                 {
-                    HttpTokens.Token t = next(buffer);
-                    if (t == null)
-                        break;
-
-                    switch (t.getType())
-                    {
-                        case LF:
-                            if (_chunkLength == 0)
-                            {
-                                setState(State.TRAILER);
-                                if (_handler.contentComplete())
-                                    return true;
-                            }
-                            else
-                                setState(State.CHUNK);
-                            break;
-                        default:
-                            break; // TODO review
-                    }
+                    if (parseChunkParams(buffer))
+                        return true;
                     break;
                 }
 
@@ -1859,6 +1863,259 @@ public class HttpParser
         return false;
     }
 
+    private boolean parseChunkParams(ByteBuffer buffer)
+    {
+        while (_state == State.CHUNK_PARAMS && buffer.hasRemaining())
+        {
+            HttpTokens.Token t = next(buffer);
+            if (t == null)
+                break;
+
+            switch (_chunkParamsState)
+            {
+                case EXT_BWS:
+                    if (t.getType() == HttpTokens.Type.LF)
+                    {
+                        if (_chunkLength == 0)
+                        {
+                            setState(State.TRAILER);
+                            return _handler.contentComplete();
+                        }
+                        setState(State.CHUNK);
+                    }
+                    else if (isBWS(t))
+                    {
+                        // optional bad whitespace
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == ';')
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_NAME_BWS_BEFORE);
+                    }
+                    else
+                    {
+                        throw new IllegalCharacterException(_state, t, buffer);
+                    }
+                    break;
+
+                case EXT_NAME_BWS_BEFORE:
+                    if (isTchar(t))
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_NAME);
+                    }
+                    else if (isBWS(t))
+                    {
+                        // optional bad whitespace
+                    }
+                    else
+                    {
+                        throw new IllegalCharacterException(_state, t, buffer);
+                    }
+                    break;
+
+                case EXT_NAME:
+                    if (t.getType() == HttpTokens.Type.LF)
+                    {
+                        if (_chunkLength == 0)
+                        {
+                            setState(State.TRAILER);
+                            return _handler.contentComplete();
+                        }
+                        setChunkParamsState(ChunkParamsState.EXT_BWS);
+                        setState(State.CHUNK);
+                    }
+                    else if (isTchar(t))
+                    {
+                        // extension-name token
+                    }
+                    else if (isBWS(t))
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_NAME_BWS_AFTER);
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == ';')
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_NAME_BWS_BEFORE);
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == '=')
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_VALUE_BWS_BEFORE);
+                    }
+                    else
+                    {
+                        throw new IllegalCharacterException(_state, t, buffer);
+                    }
+                    break;
+
+                case EXT_NAME_BWS_AFTER:
+                    if (isBWS(t))
+                    {
+                        // optional bad whitespace
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == ';')
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_NAME_BWS_BEFORE);
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == '=')
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_VALUE_BWS_BEFORE);
+                    }
+                    else
+                    {
+                        throw new IllegalCharacterException(_state, t, buffer);
+                    }
+                    break;
+
+                case EXT_VALUE_BWS_BEFORE:
+                    if (isBWS(t))
+                    {
+                        // optional bad whitespace
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == '"')
+                    {
+                        _chunkQuotedEscape = false;
+                        setChunkParamsState(ChunkParamsState.EXT_VALUE_OPEN_QUOTE);
+                    }
+                    else if (isTchar(t))
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_VALUE);
+                    }
+                    else
+                    {
+                        throw new IllegalCharacterException(_state, t, buffer);
+                    }
+                    break;
+
+                case EXT_VALUE:
+                    if (t.getType() == HttpTokens.Type.LF)
+                    {
+                        if (_chunkLength == 0)
+                        {
+                            setState(State.TRAILER);
+                            return _handler.contentComplete();
+                        }
+                        setChunkParamsState(ChunkParamsState.EXT_BWS);
+                        setState(State.CHUNK);
+                    }
+                    else if (isTchar(t))
+                    {
+                        // extension value token
+                    }
+                    else if (isBWS(t))
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_BWS);
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == ';')
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_NAME_BWS_BEFORE);
+                    }
+                    else
+                    {
+                        throw new IllegalCharacterException(_state, t, buffer);
+                    }
+                    break;
+
+                case EXT_VALUE_OPEN_QUOTE:
+                    if (_chunkQuotedEscape)
+                    {
+                        if (!isQuotedPair(t))
+                            throw new IllegalCharacterException(_state, t, buffer);
+                        _chunkQuotedEscape = false;
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == '\\')
+                    {
+                        _chunkQuotedEscape = true;
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == '"')
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_VALUE_CLOSE_QUOTE);
+                    }
+                    else if (!isQdText(t))
+                    {
+                        throw new IllegalCharacterException(_state, t, buffer);
+                    }
+                    break;
+
+                case EXT_VALUE_CLOSE_QUOTE:
+                    if (t.getType() == HttpTokens.Type.LF)
+                    {
+                        if (_chunkLength == 0)
+                        {
+                            setState(State.TRAILER);
+                            return _handler.contentComplete();
+                        }
+                        setChunkParamsState(ChunkParamsState.EXT_BWS);
+                        setState(State.CHUNK);
+                    }
+                    else if (isBWS(t))
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_BWS);
+                    }
+                    else if (t.getType() == HttpTokens.Type.VCHAR && t.getChar() == ';')
+                    {
+                        setChunkParamsState(ChunkParamsState.EXT_NAME_BWS_BEFORE);
+                    }
+                    else
+                    {
+                        throw new IllegalCharacterException(_state, t, buffer);
+                    }
+                    break;
+
+                default:
+                    throw new IllegalStateException("Unknown state " + _chunkParamsState);
+            }
+        }
+        return false;
+    }
+
+    private boolean isBWS(HttpTokens.Token t)
+    {
+        return t.getType() == HttpTokens.Type.SPACE || t.getType() == HttpTokens.Type.HTAB;
+    }
+
+    private boolean isTchar(HttpTokens.Token t)
+    {
+        HttpTokens.Type type = t.getType();
+        return type == HttpTokens.Type.TCHAR || type == HttpTokens.Type.DIGIT || type == HttpTokens.Type.ALPHA;
+    }
+
+    private boolean isQdText(HttpTokens.Token t)
+    {
+        switch (t.getType())
+        {
+            case HTAB:
+            case SPACE:
+            case OTEXT:
+                return true;
+            default:
+                char c = t.getChar();
+                return c == 0x21 || (c >= 0x23 && c <= 0x5B) || (c >= 0x5D && c <= 0x7E);
+        }
+    }
+
+    private boolean isQuotedPair(HttpTokens.Token t)
+    {
+        switch (t.getType())
+        {
+            case HTAB:
+            case SPACE:
+            case COLON:
+            case TCHAR:
+            case VCHAR:
+            case DIGIT:
+            case ALPHA:
+            case OTEXT:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void setChunkParamsState(ChunkParamsState state)
+    {
+        if (debug)
+            LOG.debug("{}:{} --> {}", _state, _chunkParamsState, state);
+        _chunkParamsState = state;
+    }
+
     public boolean isAtEOF()
     {
         return _eof;
@@ -1899,6 +2156,10 @@ public class HttpParser
         _hasContentLength = false;
         _hasTransferEncoding = false;
         _contentPosition = 0;
+        _chunkLength = 0;
+        _chunkPosition = 0;
+        _chunkParamsState = ChunkParamsState.EXT_BWS;
+        _chunkQuotedEscape = false;
         _responseStatus = 0;
         _contentChunk = null;
         _headerBytes = 0;
