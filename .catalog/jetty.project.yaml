@@ -1,0 +1,24 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: devops-jetty-project
+  title: Jetty Project
+  description: Eclipse Jetty is a web container and client stack supporting HTTP/3, HTTP/2, HTTP/1, WebSocket, servlets, and related protocols.
+  annotations:
+    # github plugin
+    github.com/project-slug: AlaudaDevops/jetty.project
+    # acp cicd plugin
+    # acp.cpaas.io/ci-pipeline: ""
+    acp.cpaas.io/instance: edge.alauda.cn
+    # sonarqube plugin
+    sonarqube.org/project-key: github.com-AlaudaDevops-jetty.project
+    acp.cpaas.io/owner: kychen@alauda.io
+
+    # 组件属性，区别是否部署时必带的核心组件,可选值为 core 和 plugin。
+    acp.cpaas.io/functional-attributes: plugin
+
+spec:
+  type: library
+  system: system:alauda-devops-system
+  lifecycle: production
+  owner: devops
