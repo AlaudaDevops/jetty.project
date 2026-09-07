@@ -19,6 +19,7 @@
 package org.eclipse.jetty.security.authentication;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -156,6 +157,8 @@ public class DigestAuthenticator extends LoginAuthenticator
                             {
                                 if ("username".equalsIgnoreCase(name))
                                     digest.username = tok;
+                                else if ("username*".equalsIgnoreCase(name))
+                                    digest.usernameStar = tok;
                                 else if ("realm".equalsIgnoreCase(name))
                                     digest.realm = tok;
                                 else if ("nonce".equalsIgnoreCase(name))
@@ -175,6 +178,17 @@ public class DigestAuthenticator extends LoginAuthenticator
                     }
                 }
 
+                // RFC 7616[3.4]: username and username* are mutually exclusive.
+                if (digest.username.length() > 0 && digest.usernameStar != null)
+                    return sendChallenge(request, response, baseRequest, false);
+                if (digest.usernameStar != null)
+                {
+                    String decoded = decodeUserNameStar(digest.usernameStar);
+                    if (decoded == null)
+                        return sendChallenge(request, response, baseRequest, false);
+                    digest.username = decoded;
+                }
+
                 int n = checkNonce(digest, baseRequest);
 
                 if (n > 0)
@@ -190,27 +204,62 @@ public class DigestAuthenticator extends LoginAuthenticator
                     stale = true;
             }
 
-            if (!DeferredAuthentication.isDeferred(response))
-            {
-                String domain = request.getContextPath();
-                if (domain == null)
-                    domain = "/";
-                response.setHeader(HttpHeader.WWW_AUTHENTICATE.asString(), "Digest realm=\"" + _loginService.getName() +
-                    "\", domain=\"" + domain +
-                    "\", nonce=\"" + newNonce(baseRequest) +
-                    "\", algorithm=MD5" +
-                    ", qop=\"auth\"" +
-                    ", stale=" + stale);
-                response.sendError(HttpServletResponse.SC_UNAUTHORIZED);
-
-                return Authentication.SEND_CONTINUE;
-            }
-
-            return Authentication.UNAUTHENTICATED;
+            return sendChallenge(request, response, baseRequest, stale);
         }
         catch (IOException e)
         {
             throw new ServerAuthException(e);
+        }
+    }
+
+    private Authentication sendChallenge(HttpServletRequest request, HttpServletResponse response, Request baseRequest, boolean stale)
+        throws IOException
+    {
+        if (!DeferredAuthentication.isDeferred(response))
+        {
+            String domain = request.getContextPath();
+            if (domain == null)
+                domain = "/";
+            // RFC 7616[3.3]: charset tells the client to encode the username
+            // and the password with UTF-8 rather than with ISO-8859-1.
+            response.setHeader(HttpHeader.WWW_AUTHENTICATE.asString(), "Digest realm=\"" + _loginService.getName() +
+                "\", domain=\"" + domain +
+                "\", nonce=\"" + newNonce(baseRequest) +
+                "\", algorithm=MD5" +
+                ", qop=\"auth\"" +
+                ", charset=UTF-8" +
+                ", stale=" + stale);
+            response.sendError(HttpServletResponse.SC_UNAUTHORIZED);
+
+            return Authentication.SEND_CONTINUE;
+        }
+
+        return Authentication.UNAUTHENTICATED;
+    }
+
+    /**
+     * <p>Decodes the RFC 5987 encoded {@code username*} parameter, for example
+     * {@code UTF-8''caf%E2%82%AC} is decoded as {@code caf€}.</p>
+     *
+     * @param encodedUserName the encoded username
+     * @return the decoded username, or {@code null} if it cannot be decoded
+     */
+    protected String decodeUserNameStar(String encodedUserName)
+    {
+        try
+        {
+            if (encodedUserName == null)
+                return null;
+            String encodedPrefix = "UTF-8''";
+            if (encodedUserName.regionMatches(true, 0, encodedPrefix, 0, encodedPrefix.length()))
+                return URI.create("scheme:" + encodedUserName.substring(encodedPrefix.length())).getSchemeSpecificPart();
+            return null;
+        }
+        catch (Throwable x)
+        {
+            // Likely a badly encoded username.
+            LOG.ignore(x);
+            return null;
         }
     }
 
@@ -311,6 +360,7 @@ public class DigestAuthenticator extends LoginAuthenticator
         private static final long serialVersionUID = -2484639019549527724L;
         final String method;
         String username = "";
+        String usernameStar = null;
         String realm = "";
         String nonce = "";
         String nc = "";
@@ -345,18 +395,20 @@ public class DigestAuthenticator extends LoginAuthenticator
                 else
                 {
                     // calc A1 digest
-                    md.update(username.getBytes(StandardCharsets.ISO_8859_1));
+                    // Hash with UTF-8: ISO-8859-1 silently replaces every character
+                    // above U+00FF with '?', so distinct passwords would collide.
+                    md.update(username.getBytes(StandardCharsets.UTF_8));
                     md.update((byte)':');
-                    md.update(realm.getBytes(StandardCharsets.ISO_8859_1));
+                    md.update(realm.getBytes(StandardCharsets.UTF_8));
                     md.update((byte)':');
-                    md.update(password.getBytes(StandardCharsets.ISO_8859_1));
+                    md.update(password.getBytes(StandardCharsets.UTF_8));
                     ha1 = md.digest();
                 }
                 // calc A2 digest
                 md.reset();
-                md.update(method.getBytes(StandardCharsets.ISO_8859_1));
+                md.update(method.getBytes(StandardCharsets.UTF_8));
                 md.update((byte)':');
-                md.update(uri.getBytes(StandardCharsets.ISO_8859_1));
+                md.update(uri.getBytes(StandardCharsets.UTF_8));
                 byte[] ha2 = md.digest();
 
                 // calc digest
@@ -366,17 +418,17 @@ public class DigestAuthenticator extends LoginAuthenticator
                 // request-digest = <"> < KD ( H(A1), unq(nonce-value) ":" H(A2)
                 // ) > <">
 
-                md.update(TypeUtil.toString(ha1, 16).getBytes(StandardCharsets.ISO_8859_1));
+                md.update(TypeUtil.toString(ha1, 16).getBytes(StandardCharsets.UTF_8));
                 md.update((byte)':');
-                md.update(nonce.getBytes(StandardCharsets.ISO_8859_1));
+                md.update(nonce.getBytes(StandardCharsets.UTF_8));
                 md.update((byte)':');
-                md.update(nc.getBytes(StandardCharsets.ISO_8859_1));
+                md.update(nc.getBytes(StandardCharsets.UTF_8));
                 md.update((byte)':');
-                md.update(cnonce.getBytes(StandardCharsets.ISO_8859_1));
+                md.update(cnonce.getBytes(StandardCharsets.UTF_8));
                 md.update((byte)':');
-                md.update(qop.getBytes(StandardCharsets.ISO_8859_1));
+                md.update(qop.getBytes(StandardCharsets.UTF_8));
                 md.update((byte)':');
-                md.update(TypeUtil.toString(ha2, 16).getBytes(StandardCharsets.ISO_8859_1));
+                md.update(TypeUtil.toString(ha2, 16).getBytes(StandardCharsets.UTF_8));
                 byte[] digest = md.digest();
 
                 // check digest

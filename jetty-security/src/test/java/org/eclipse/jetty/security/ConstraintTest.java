@@ -74,6 +74,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
@@ -121,6 +122,7 @@ public class ConstraintTest
         loginService.putUser("user2", new Password("password"), new String[]{"user"});
         loginService.putUser("admin", new Password("password"), new String[]{"user", "administrator"});
         loginService.putUser("user3", new Password("password"), new String[]{"foo"});
+        loginService.putUser("utf8user", new Password("\u043f\u0430\u0440\u043e\u043b\u044c123"), new String[]{"user"});
 
         contextHandler.setContextPath("/ctx");
         _server.setHandler(contextHandler);
@@ -783,17 +785,17 @@ public class ConstraintTest
         MessageDigest md = MessageDigest.getInstance("MD5");
         byte[] ha1;
         // calc A1 digest
-        md.update(username.getBytes(ISO_8859_1));
+        md.update(username.getBytes(UTF_8));
         md.update((byte)':');
-        md.update("TestRealm".getBytes(ISO_8859_1));
+        md.update("TestRealm".getBytes(UTF_8));
         md.update((byte)':');
-        md.update(password.getBytes(ISO_8859_1));
+        md.update(password.getBytes(UTF_8));
         ha1 = md.digest();
         // calc A2 digest
         md.reset();
-        md.update("GET".getBytes(ISO_8859_1));
+        md.update("GET".getBytes(UTF_8));
         md.update((byte)':');
-        md.update(uri.getBytes(ISO_8859_1));
+        md.update(uri.getBytes(UTF_8));
         byte[] ha2 = md.digest();
 
         // calc digest
@@ -803,21 +805,62 @@ public class ConstraintTest
         // request-digest = <"> < KD ( H(A1), unq(nonce-value) ":" H(A2)
         // ) > <">
 
-        md.update(TypeUtil.toString(ha1, 16).getBytes(ISO_8859_1));
+        md.update(TypeUtil.toString(ha1, 16).getBytes(UTF_8));
         md.update((byte)':');
-        md.update(nonce.getBytes(ISO_8859_1));
+        md.update(nonce.getBytes(UTF_8));
         md.update((byte)':');
-        md.update(nc.getBytes(ISO_8859_1));
+        md.update(nc.getBytes(UTF_8));
         md.update((byte)':');
-        md.update(CNONCE.getBytes(ISO_8859_1));
+        md.update(CNONCE.getBytes(UTF_8));
         md.update((byte)':');
-        md.update("auth".getBytes(ISO_8859_1));
+        md.update("auth".getBytes(UTF_8));
         md.update((byte)':');
-        md.update(TypeUtil.toString(ha2, 16).getBytes(ISO_8859_1));
+        md.update(TypeUtil.toString(ha2, 16).getBytes(UTF_8));
         byte[] digest = md.digest();
 
         // check digest
         return TypeUtil.toString(digest, 16);
+    }
+
+    @Test
+    public void testDigestNonLatin1PasswordIsNotLossilyEncoded() throws Exception
+    {
+        // CVE-2026-10050: hashing the password with ISO-8859-1 replaces every
+        // character above U+00FF with '?', so "\u043f\u0430\u0440\u043e\u043b\u044c123" used to hash
+        // exactly like "??????123", letting anybody authenticate with the latter.
+        DigestAuthenticator authenticator = new DigestAuthenticator();
+        authenticator.setMaxNonceCount(5);
+        _security.setAuthenticator(authenticator);
+        _server.start();
+
+        String response = _connector.getResponse("GET /ctx/auth/info HTTP/1.0\r\n\r\n");
+        assertThat(response, startsWith("HTTP/1.1 401 Unauthorized"));
+        // RFC 7616[3.3]: tell the client to encode the credentials with UTF-8.
+        assertThat(response, containsString("charset=UTF-8"));
+
+        Matcher matcher = Pattern.compile("nonce=\"([^\"]*)\",").matcher(response);
+        assertTrue(matcher.find());
+        String nonce = matcher.group(1);
+
+        // The lossy ISO-8859-1 encoding of the real password must not authenticate.
+        String digest = digest(nonce, "utf8user", "??????123", "/ctx/auth/info", "1");
+        response = _connector.getResponse("GET /ctx/auth/info HTTP/1.0\r\n" +
+            "Authorization: Digest username=\"utf8user\", qop=auth, cnonce=\"1234567890\", uri=\"/ctx/auth/info\", realm=\"TestRealm\", " +
+            "nc=1, " +
+            "nonce=\"" + nonce + "\", " +
+            "response=\"" + digest + "\"\r\n" +
+            "\r\n");
+        assertThat(response, startsWith("HTTP/1.1 401 Unauthorized"));
+
+        // The real password, hashed with UTF-8, must authenticate.
+        digest = digest(nonce, "utf8user", "\u043f\u0430\u0440\u043e\u043b\u044c123", "/ctx/auth/info", "2");
+        response = _connector.getResponse("GET /ctx/auth/info HTTP/1.0\r\n" +
+            "Authorization: Digest username=\"utf8user\", qop=auth, cnonce=\"1234567890\", uri=\"/ctx/auth/info\", realm=\"TestRealm\", " +
+            "nc=2, " +
+            "nonce=\"" + nonce + "\", " +
+            "response=\"" + digest + "\"\r\n" +
+            "\r\n");
+        assertThat(response, startsWith("HTTP/1.1 200 OK"));
     }
 
     @Test
