@@ -1,0 +1,96 @@
+name: Release Jetty Server/Security Backport
+
+on:
+  push:
+    tags:
+      - "v9.4.63.v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 9.4.63.v20260907"
+        required: true
+        default: "9.4.63.v20260907"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Resolve release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            RAW_VERSION="${{ github.event.inputs.version }}"
+          else
+            RAW_VERSION="${GITHUB_REF_NAME}"
+          fi
+          PATCH_VERSION="${RAW_VERSION#v}"
+          echo "PATCH_VERSION=${PATCH_VERSION}" >> "${GITHUB_ENV}"
+          echo "Patch version: ${PATCH_VERSION}"
+
+      - name: Build modules and run backport regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mvn -Pfast -pl build-resources -DskipTests install
+          mvn -pl jetty-server,jetty-security -am -Pfast -Denforcer.skip=true -Dcheckstyle.skip=true -DskipTests install
+          # Only the tests covering the backported fixes are run: this 9.4 branch
+          # has test failures that predate the backports (chunked-body reads and
+          # ConstraintTest.testNonFormPostRedirectHttp11) on modern JDKs.
+          mvn -pl jetty-server -Denforcer.skip=true -Dcheckstyle.skip=true \
+            -Dtest='HttpConnectionTest#testMismatchedAuthorityAndHost+testMatchedAuthorityAndHost+testAuthorityAndHostWithDefaultPort+testMismatchedAuthorityAndHostPort+testCONNECT' \
+            -Dsurefire.failIfNoSpecifiedTests=true test
+          mvn -pl jetty-security -Denforcer.skip=true -Dcheckstyle.skip=true \
+            -Dtest='ConstraintTest#testDigestNonLatin1PasswordIsNotLossilyEncoded+testDigest' \
+            -Dsurefire.failIfNoSpecifiedTests=true test
+
+      - name: Repackage jars with patched version metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_VERSION="$(grep -m1 '<version>' pom.xml | sed -E 's/.*<version>([^<]+)<.*/\1/')"
+          OUT_DIR=/tmp/release
+          mkdir -p "${OUT_DIR}"
+          for MODULE in jetty-server jetty-security; do
+            SRC_JAR="${MODULE}/target/${MODULE}-${BASE_VERSION}.jar"
+            OUT_JAR="${OUT_DIR}/${MODULE}-${PATCH_VERSION}.jar"
+            WORK_DIR="/tmp/${MODULE}-work"
+
+            rm -rf "${WORK_DIR}"
+            mkdir -p "${WORK_DIR}"
+            cd "${WORK_DIR}"
+            jar xf "${GITHUB_WORKSPACE}/${SRC_JAR}"
+            sed -i "s/${BASE_VERSION}/${PATCH_VERSION}/g" \
+              META-INF/MANIFEST.MF \
+              "META-INF/maven/org.eclipse.jetty/${MODULE}/pom.properties" \
+              "META-INF/maven/org.eclipse.jetty/${MODULE}/pom.xml"
+            jar cfm "${OUT_JAR}" META-INF/MANIFEST.MF -C "${WORK_DIR}" .
+            cd "${GITHUB_WORKSPACE}"
+            ls -lh "${OUT_JAR}"
+          done
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-backport-${{ env.PATCH_VERSION }}
+          path: /tmp/release/*.jar
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.PATCH_VERSION }}
+          name: v${{ env.PATCH_VERSION }}
+          files: /tmp/release/*.jar
+          generate_release_notes: true
