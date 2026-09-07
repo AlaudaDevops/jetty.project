@@ -45,8 +45,10 @@ import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpGenerator;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpHeaderValue;
+import org.eclipse.jetty.http.HttpMethod;
 import org.eclipse.jetty.http.HttpScheme;
 import org.eclipse.jetty.http.HttpStatus;
+import org.eclipse.jetty.http.HttpURI;
 import org.eclipse.jetty.http.HttpVersion;
 import org.eclipse.jetty.http.MetaData;
 import org.eclipse.jetty.io.ByteBufferPool;
@@ -845,6 +847,16 @@ public class HttpChannel implements Runnable, HttpOutput.Interceptor
 
     public void onRequest(MetaData.Request request)
     {
+        // RFC 9110/9112 require the request authority (the absolute-form request-target
+        // for HTTP/1, or the :authority pseudo-header for HTTP/2 and HTTP/3) and the Host
+        // header to be consistent. Checking it here covers every HTTP version, because all
+        // of them funnel through this method.
+        // CONNECT is excluded: its request-target is authority-form and a proxy
+        // is legitimately addressed by a Host header of its own.
+        if (!HttpMethod.CONNECT.is(request.getMethod()) &&
+            !authorityMatches(request.getURI(), request.getFields().get(HttpHeader.HOST)))
+            throw new BadMessageException(HttpStatus.BAD_REQUEST_400, "Authority!=Host");
+
         _requests.incrementAndGet();
         _request.setTimeStamp(System.currentTimeMillis());
         HttpFields fields = _response.getHttpFields();
@@ -867,6 +879,61 @@ public class HttpChannel implements Runnable, HttpOutput.Interceptor
             LOG.debug("REQUEST for {} on {}{}{} {} {}{}{}", request.getURIString(), this, System.lineSeparator(),
                 request.getMethod(), request.getURIString(), request.getHttpVersion(), System.lineSeparator(),
                 request.getFields());
+    }
+
+    /**
+     * <p>Checks that the request authority, if any, is consistent with the {@code Host}
+     * header, if any, as required by RFC 9110 and RFC 9112.</p>
+     *
+     * @param uri the request URI
+     * @param host the value of the {@code Host} header, may be {@code null}
+     * @return whether the authority and the {@code Host} header are consistent
+     */
+    private boolean authorityMatches(HttpURI uri, String host)
+    {
+        if (uri == null)
+            return true;
+
+        String authority = uri.getAuthority();
+        // Either both are absent, or only one is present.
+        if (authority == null || host == null)
+            return true;
+
+        // Direct hit, hosts must be compared ignoring case.
+        if (authority.equalsIgnoreCase(host))
+            return true;
+
+        try
+        {
+            // Handle default ports: example.com matches example.com:80.
+            int defaultPort = defaultPortForScheme(uri.getScheme());
+            int uriPort = uri.getPort();
+            int effectiveURIPort = uriPort <= 0 ? defaultPort : uriPort;
+            HostPort hostPort = new HostPort(host);
+            int port = hostPort.getPort();
+            int effectiveHostPort = port <= 0 ? defaultPort : port;
+            if (effectiveURIPort != effectiveHostPort)
+                return false;
+
+            // Same effective port, compare hosts ignoring case.
+            return hostPort.getHost().equalsIgnoreCase(uri.getHost());
+        }
+        catch (Throwable x)
+        {
+            // An unparseable Host header cannot be shown to match the authority.
+            if (LOG.isDebugEnabled())
+                LOG.debug("Unable to compare authority with Host header", x);
+            return false;
+        }
+    }
+
+    private static int defaultPortForScheme(String scheme)
+    {
+        if (HttpScheme.HTTP.is(scheme) || HttpScheme.WS.is(scheme))
+            return 80;
+        if (HttpScheme.HTTPS.is(scheme) || HttpScheme.WSS.is(scheme))
+            return 443;
+        return 0;
     }
 
     public boolean onContent(HttpInput.Content content)

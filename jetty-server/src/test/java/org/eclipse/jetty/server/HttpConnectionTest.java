@@ -110,6 +110,49 @@ public class HttpConnectionTest
     }
 
     @Test
+    public void testMismatchedAuthorityAndHost() throws Exception
+    {
+        // RFC 9110/9112: an absolute-form request-target and the Host header must match.
+        String response = connector.getResponse("GET http://localhost/R1 HTTP/1.1\r\n" +
+            "Host: evil.example.org\r\n" +
+            "Connection: close\r\n" +
+            "\r\n");
+        checkContains(response, 0, "HTTP/1.1 400");
+        assertThat(response, containsString("Authority!=Host"));
+    }
+
+    @Test
+    public void testMatchedAuthorityAndHost() throws Exception
+    {
+        String response = connector.getResponse("GET http://localhost/R1 HTTP/1.1\r\n" +
+            "Host: localhost\r\n" +
+            "Connection: close\r\n" +
+            "\r\n");
+        checkContains(response, 0, "HTTP/1.1 200");
+    }
+
+    @Test
+    public void testAuthorityAndHostWithDefaultPort() throws Exception
+    {
+        // example.com and example.com:80 are the same authority for the http scheme.
+        String response = connector.getResponse("GET http://localhost/R1 HTTP/1.1\r\n" +
+            "Host: LocalHost:80\r\n" +
+            "Connection: close\r\n" +
+            "\r\n");
+        checkContains(response, 0, "HTTP/1.1 200");
+    }
+
+    @Test
+    public void testMismatchedAuthorityAndHostPort() throws Exception
+    {
+        String response = connector.getResponse("GET http://localhost:8888/R1 HTTP/1.1\r\n" +
+            "Host: localhost:9999\r\n" +
+            "Connection: close\r\n" +
+            "\r\n");
+        checkContains(response, 0, "HTTP/1.1 400");
+    }
+
+    @Test
     public void testFragmentedChunk() throws Exception
     {
         String response = null;
